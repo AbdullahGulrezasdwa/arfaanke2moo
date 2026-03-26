@@ -1,14 +1,13 @@
 'use client'
 
 import { createClient } from '@/lib/supabase/client'
-import { useEffect, useState, useCallback, useRef } from 'react'
+import { useEffect, useState, useCallback, useRef, useMemo } from 'react'
 import type {
   Profile,
   FriendRequest,
   Message,
   ChatUser,
 } from '@/lib/types'
-import type { RealtimeChannel } from '@supabase/supabase-js'
 
 export function useChat(currentUserId: string | null) {
   const [friends, setFriends] = useState<ChatUser[]>([])
@@ -20,56 +19,41 @@ export function useChat(currentUserId: string | null) {
   const [isLoading, setIsLoading] = useState(true)
   
   const supabase = createClient()
-  const channelRef = useRef<RealtimeChannel | null>(null)
-  const presenceChannelRef = useRef<RealtimeChannel | null>(null)
+  
+  // Use a ref for the selected friend so the Realtime listener 
+  // doesn't have to restart every time you switch chats.
+  const selectedFriendRef = useRef<string | null>(null)
+  useEffect(() => {
+    selectedFriendRef.current = selectedFriend?.id || null
+  }, [selectedFriend])
 
-  // Fetch friends list
+  // --- 1. DATA FETCHERS (Static Dependencies) ---
   const fetchFriends = useCallback(async () => {
     if (!currentUserId) return
-
-    const { data, error } = await supabase
+    const { data } = await supabase
       .from('friendships')
-      .select(`
-        id,
-        friend_id,
-        friend:profiles!friendships_friend_id_fkey(*)
-      `)
+      .select(`id, friend_id, friend:profiles!friendships_friend_id_fkey(*)`)
       .eq('user_id', currentUserId)
 
-    if (error) {
-      console.error('Error fetching friends:', error)
-      return
+    if (data) {
+      setFriends(data.map((f) => ({
+        ...((f.friend as unknown as Profile) || {}),
+        isOnline: false,
+      })) as ChatUser[])
     }
+  }, [currentUserId, supabase])
 
-    const friendsList: ChatUser[] = (data || []).map((f) => ({
-      ...((f.friend as unknown as Profile) || {}),
-      isOnline: onlineUsers.has(f.friend_id),
-    })) as ChatUser[]
-
-    setFriends(friendsList)
-  }, [currentUserId, supabase, onlineUsers])
-
-  // Fetch friend requests
   const fetchRequests = useCallback(async () => {
     if (!currentUserId) return
-
-    // Pending requests (received)
     const { data: pending } = await supabase
       .from('friend_requests')
-      .select(`
-        *,
-        from_profile:profiles!friend_requests_from_user_id_fkey(*)
-      `)
+      .select('*, from_profile:profiles!friend_requests_from_user_id_fkey(*)')
       .eq('to_user_id', currentUserId)
       .eq('status', 'pending')
 
-    // Sent requests
     const { data: sent } = await supabase
       .from('friend_requests')
-      .select(`
-        *,
-        to_profile:profiles!friend_requests_to_user_id_fkey(*)
-      `)
+      .select('*, to_profile:profiles!friend_requests_to_user_id_fkey(*)')
       .eq('from_user_id', currentUserId)
       .eq('status', 'pending')
 
@@ -77,292 +61,130 @@ export function useChat(currentUserId: string | null) {
     setSentRequests((sent || []) as FriendRequest[])
   }, [currentUserId, supabase])
 
-  // Fetch messages for selected friend
   const fetchMessages = useCallback(async (friendId: string) => {
     if (!currentUserId) return
-
-    const { data, error } = await supabase
+    const { data } = await supabase
       .from('messages')
       .select('*')
       .or(`and(sender_id.eq.${currentUserId},receiver_id.eq.${friendId}),and(sender_id.eq.${friendId},receiver_id.eq.${currentUserId})`)
       .order('created_at', { ascending: true })
 
-    if (error) {
-      console.error('Error fetching messages:', error)
-      return
-    }
-
     setMessages(data || [])
-
-    // Mark messages as read
-    await supabase
-      .from('messages')
-      .update({ read: true })
-      .eq('sender_id', friendId)
-      .eq('receiver_id', currentUserId)
-      .eq('read', false)
+    
+    // Mark as read
+    await supabase.from('messages').update({ read: true })
+      .eq('sender_id', friendId).eq('receiver_id', currentUserId).eq('read', false)
   }, [currentUserId, supabase])
 
-  // Send message
-  const sendMessage = useCallback(async (content: string) => {
-    if (!currentUserId || !selectedFriend || !content.trim()) return
-
-    const { error } = await supabase.from('messages').insert({
-      sender_id: currentUserId,
-      receiver_id: selectedFriend.id,
-      content: content.trim(),
-    })
-
-    if (error) {
-      console.error('Error sending message:', error)
-    }
-  }, [currentUserId, selectedFriend, supabase])
-
-  // Send friend request
-  const sendFriendRequest = useCallback(async (username: string) => {
-    if (!currentUserId) return { success: false, error: 'Not logged in' }
-
-    // Find user by username
-    const { data: profile, error: profileError } = await supabase
-      .from('profiles')
-      .select('id')
-      .eq('username', username.toLowerCase())
-      .single()
-
-    if (profileError || !profile) {
-      return { success: false, error: 'User not found' }
-    }
-
-    if (profile.id === currentUserId) {
-      return { success: false, error: 'You cannot add yourself' }
-    }
-
-    // Check if already friends
-    const { data: existingFriendship } = await supabase
-      .from('friendships')
-      .select('id')
-      .eq('user_id', currentUserId)
-      .eq('friend_id', profile.id)
-      .single()
-
-    if (existingFriendship) {
-      return { success: false, error: 'Already friends with this user' }
-    }
-
-    // Check for existing request
-    const { data: existingRequest } = await supabase
-      .from('friend_requests')
-      .select('id, status')
-      .or(`and(from_user_id.eq.${currentUserId},to_user_id.eq.${profile.id}),and(from_user_id.eq.${profile.id},to_user_id.eq.${currentUserId})`)
-      .eq('status', 'pending')
-      .single()
-
-    if (existingRequest) {
-      return { success: false, error: 'Friend request already exists' }
-    }
-
-    const { error } = await supabase.from('friend_requests').insert({
-      from_user_id: currentUserId,
-      to_user_id: profile.id,
-    })
-
-    if (error) {
-      return { success: false, error: error.message }
-    }
-
-    await fetchRequests()
-    return { success: true, error: null }
-  }, [currentUserId, supabase, fetchRequests])
-
-  // Accept friend request
-  const acceptFriendRequest = useCallback(async (requestId: string, fromUserId: string) => {
-    if (!currentUserId) return
-
-    // Update request status
-    await supabase
-      .from('friend_requests')
-      .update({ status: 'accepted' })
-      .eq('id', requestId)
-
-    // Create bidirectional friendships
-    await supabase.from('friendships').insert([
-      { user_id: currentUserId, friend_id: fromUserId },
-      { user_id: fromUserId, friend_id: currentUserId },
-    ])
-
-    await fetchFriends()
-    await fetchRequests()
-  }, [currentUserId, supabase, fetchFriends, fetchRequests])
-
-  // Reject friend request
-  const rejectFriendRequest = useCallback(async (requestId: string) => {
-    await supabase
-      .from('friend_requests')
-      .update({ status: 'rejected' })
-      .eq('id', requestId)
-
-    await fetchRequests()
-  }, [supabase, fetchRequests])
-
-  // Cancel sent friend request
-  const cancelFriendRequest = useCallback(async (requestId: string) => {
-    await supabase
-      .from('friend_requests')
-      .delete()
-      .eq('id', requestId)
-
-    await fetchRequests()
-  }, [supabase, fetchRequests])
-
-  // Remove friend
-  const removeFriend = useCallback(async (friendId: string) => {
-    if (!currentUserId) return
-
-    // Delete both directions
-    await supabase
-      .from('friendships')
-      .delete()
-      .or(`and(user_id.eq.${currentUserId},friend_id.eq.${friendId}),and(user_id.eq.${friendId},friend_id.eq.${currentUserId})`)
-
-    if (selectedFriend?.id === friendId) {
-      setSelectedFriend(null)
-    }
-
-    await fetchFriends()
-  }, [currentUserId, supabase, selectedFriend, fetchFriends])
-
-  // Set up realtime subscriptions
+  // --- 2. REALTIME (Safe Dependencies) ---
   useEffect(() => {
     if (!currentUserId) return
 
-    // Messages subscription
-    channelRef.current = supabase
-      .channel('chat-messages')
-      .on(
-        'postgres_changes',
-        {
-          event: 'INSERT',
-          schema: 'public',
-          table: 'messages',
-          filter: `receiver_id=eq.${currentUserId}`,
-        },
-        (payload) => {
-          const newMessage = payload.new as Message
-          if (selectedFriend?.id === newMessage.sender_id) {
-            setMessages((prev) => [...prev, newMessage])
-            // Mark as read immediately
-            supabase
-              .from('messages')
-              .update({ read: true })
-              .eq('id', newMessage.id)
-          }
+    const channel = supabase.channel('db-updates')
+      .on('postgres_changes', { event: 'INSERT', schema: 'public', table: 'messages' }, (payload) => {
+        const msg = payload.new as Message
+        if (selectedFriendRef.current === msg.sender_id || selectedFriendRef.current === msg.receiver_id) {
+          setMessages(prev => [...prev, msg])
         }
-      )
-      .on(
-        'postgres_changes',
-        {
-          event: 'INSERT',
-          schema: 'public',
-          table: 'messages',
-          filter: `sender_id=eq.${currentUserId}`,
-        },
-        (payload) => {
-          const newMessage = payload.new as Message
-          if (selectedFriend?.id === newMessage.receiver_id) {
-            setMessages((prev) => [...prev, newMessage])
-          }
-        }
-      )
-      .on(
-        'postgres_changes',
-        {
-          event: '*',
-          schema: 'public',
-          table: 'friend_requests',
-        },
-        () => {
-          fetchRequests()
-        }
-      )
-      .on(
-        'postgres_changes',
-        {
-          event: '*',
-          schema: 'public',
-          table: 'friendships',
-        },
-        () => {
-          fetchFriends()
-        }
-      )
+      })
+      .on('postgres_changes', { event: '*', schema: 'public', table: 'friend_requests' }, () => fetchRequests())
+      .on('postgres_changes', { event: '*', schema: 'public', table: 'friendships' }, () => fetchFriends())
       .subscribe()
 
-    // Presence channel for online status
-    presenceChannelRef.current = supabase
-      .channel('online-users')
+    const presence = supabase.channel('online-sync')
       .on('presence', { event: 'sync' }, () => {
-        const state = presenceChannelRef.current?.presenceState() || {}
+        const state = presence.presenceState()
         const online = new Set<string>()
-        Object.values(state).forEach((users) => {
-          (users as Array<{ user_id: string }>).forEach((u) => {
-            online.add(u.user_id)
-          })
+        Object.values(state).forEach((items: any) => {
+          items.forEach((p: any) => online.add(p.user_id))
         })
         setOnlineUsers(online)
       })
       .subscribe(async (status) => {
-        if (status === 'SUBSCRIBED') {
-          await presenceChannelRef.current?.track({ user_id: currentUserId })
-        }
+        if (status === 'SUBSCRIBED') await presence.track({ user_id: currentUserId })
       })
 
     return () => {
-      if (channelRef.current) {
-        supabase.removeChannel(channelRef.current)
-      }
-      if (presenceChannelRef.current) {
-        supabase.removeChannel(presenceChannelRef.current)
-      }
+      supabase.removeChannel(channel)
+      supabase.removeChannel(presence)
     }
-  }, [currentUserId, selectedFriend?.id, supabase, fetchRequests, fetchFriends])
+  }, [currentUserId, supabase, fetchFriends, fetchRequests])
 
-  // Update friends online status when onlineUsers changes
+  // --- 3. INITIAL LOAD ---
   useEffect(() => {
-    setFriends((prev) =>
-      prev.map((f) => ({ ...f, isOnline: onlineUsers.has(f.id) }))
-    )
-  }, [onlineUsers])
-
-  // Initial data fetch
-  useEffect(() => {
-    if (!currentUserId) return
-
-    const loadData = async () => {
+    const load = async () => {
       setIsLoading(true)
       await Promise.all([fetchFriends(), fetchRequests()])
       setIsLoading(false)
     }
+    load()
+  }, [fetchFriends, fetchRequests])
 
-    loadData()
-  }, [currentUserId, fetchFriends, fetchRequests])
-
-  // Fetch messages when friend is selected
+  // --- 4. MESSAGE SYNC ---
   useEffect(() => {
-    if (selectedFriend) {
-      fetchMessages(selectedFriend.id)
-    } else {
-      setMessages([])
-    }
+    if (selectedFriend) fetchMessages(selectedFriend.id)
+    else setMessages([])
   }, [selectedFriend, fetchMessages])
 
+  // --- 5. LOOP BREAKER (Derived State) ---
+  const friendsWithStatus = useMemo(() => {
+    return friends.map(f => ({
+      ...f,
+      isOnline: onlineUsers.has(f.id)
+    }))
+  }, [friends, onlineUsers])
+
+  // --- ACTIONS ---
+  const sendMessage = async (content: string) => {
+    if (!currentUserId || !selectedFriend || !content.trim()) return
+    await supabase.from('messages').insert({
+      sender_id: currentUserId,
+      receiver_id: selectedFriend.id,
+      content: content.trim(),
+    })
+  }
+
+  const sendFriendRequest = async (username: string) => {
+    if (!currentUserId) return { success: false, error: 'Not logged in' }
+    const { data: profile } = await supabase.from('profiles').select('id').eq('username', username.toLowerCase()).single()
+    if (!profile) return { success: false, error: 'User not found' }
+    const { error } = await supabase.from('friend_requests').insert({ from_user_id: currentUserId, to_user_id: profile.id })
+    if (error) return { success: false, error: error.message }
+    await fetchRequests()
+    return { success: true, error: null }
+  }
+
+  const acceptFriendRequest = async (requestId: string, fromUserId: string) => {
+    if (!currentUserId) return
+    await supabase.from('friend_requests').update({ status: 'accepted' }).eq('id', requestId)
+    await supabase.from('friendships').insert([{ user_id: currentUserId, friend_id: fromUserId }, { user_id: fromUserId, friend_id: currentUserId }])
+    await fetchFriends(); await fetchRequests()
+  }
+
+  const rejectFriendRequest = async (requestId: string) => {
+    await supabase.from('friend_requests').update({ status: 'rejected' }).eq('id', requestId)
+    await fetchRequests()
+  }
+
+  const cancelFriendRequest = async (requestId: string) => {
+    await supabase.from('friend_requests').delete().eq('id', requestId)
+    await fetchRequests()
+  }
+
+  const removeFriend = async (friendId: string) => {
+    if (!currentUserId) return
+    await supabase.from('friendships').delete().or(`and(user_id.eq.${currentUserId},friend_id.eq.${friendId}),and(user_id.eq.${friendId},friend_id.eq.${currentUserId})`)
+    if (selectedFriend?.id === friendId) setSelectedFriend(null)
+    await fetchFriends()
+  }
+
   return {
-    friends,
+    friends: friendsWithStatus,
     pendingRequests,
     sentRequests,
     messages,
     selectedFriend,
     setSelectedFriend,
-    onlineUsers,
     isLoading,
     sendMessage,
     sendFriendRequest,
@@ -370,6 +192,5 @@ export function useChat(currentUserId: string | null) {
     rejectFriendRequest,
     cancelFriendRequest,
     removeFriend,
-    fetchFriends,
   }
 }
