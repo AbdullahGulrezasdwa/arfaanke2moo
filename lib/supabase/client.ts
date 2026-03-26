@@ -1,13 +1,13 @@
 import { createBrowserClient } from '@supabase/ssr'
 
-// 1. Define a variable outside the function to hold the instance
-let browserClient: ReturnType<typeof createBrowserClient> | undefined
+// This variable lives OUTSIDE the function so it persists
+let browserClient: ReturnType<typeof createBrowserClient>
 
 export function createClient() {
-  // 2. If the client already exists, don't make a new one—just return it
+  // If we already made a client, just give that one back
   if (browserClient) return browserClient
 
-  // 3. Create the client only once
+  // Otherwise, make it exactly once
   browserClient = createBrowserClient(
     process.env.NEXT_PUBLIC_SUPABASE_URL!,
     process.env.NEXT_PUBLIC_SUPABASE_ANON_KEY!
