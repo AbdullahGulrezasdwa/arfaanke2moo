@@ -41,14 +41,27 @@ export async function updateSession(request: NextRequest) {
     data: { user },
   } = await supabase.auth.getUser()
 
-  if (
-    // if the user is not logged in and the app path, in this case, /protected, is accessed, redirect to the login page
-    request.nextUrl.pathname.startsWith('/protected') &&
-    !user
-  ) {
-    // no user, potentially respond by redirecting the user to the login page
+  // Protected routes that require authentication
+  const protectedRoutes = ['/chat', '/protected']
+  const isProtectedRoute = protectedRoutes.some((route) =>
+    request.nextUrl.pathname.startsWith(route)
+  )
+
+  if (isProtectedRoute && !user) {
     const url = request.nextUrl.clone()
     url.pathname = '/auth/login'
+    return NextResponse.redirect(url)
+  }
+
+  // Redirect logged-in users away from auth pages
+  const authRoutes = ['/auth/login', '/auth/sign-up']
+  const isAuthRoute = authRoutes.some((route) =>
+    request.nextUrl.pathname.startsWith(route)
+  )
+
+  if (isAuthRoute && user) {
+    const url = request.nextUrl.clone()
+    url.pathname = '/chat'
     return NextResponse.redirect(url)
   }
 
