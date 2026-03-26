@@ -1,6 +1,6 @@
 'use client'
 
-import { useState, useCallback } from 'react'
+import { useState, useCallback, useMemo } from 'react'
 import { useRouter } from 'next/navigation'
 import { createClient } from '@/lib/supabase/client'
 import { useChat } from '@/hooks/use-chat'
@@ -17,7 +17,7 @@ interface ChatClientProps {
 
 export function ChatClient({ initialProfile }: ChatClientProps) {
   const router = useRouter()
-  const supabase = createClient()
+  const supabase = useMemo(() => createClient(), [])
 
   const [isInCall, setIsInCall] = useState(false)
   const [callPartner, setCallPartner] = useState<ChatUser | null>(null)

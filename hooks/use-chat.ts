@@ -1,7 +1,7 @@
 'use client'
 
 import { createClient } from '@/lib/supabase/client'
-import { useEffect, useState, useCallback, useRef } from 'react'
+import { useEffect, useState, useCallback, useRef, useMemo } from 'react'
 import type {
   Profile,
   FriendRequest,
@@ -19,11 +19,18 @@ export function useChat(currentUserId: string | null) {
   const [onlineUsers, setOnlineUsers] = useState<Set<string>>(new Set())
   const [isLoading, setIsLoading] = useState(true)
   
-  const supabase = createClient()
+  // Use useMemo to prevent creating new client on every render
+  const supabase = useMemo(() => createClient(), [])
   const channelRef = useRef<RealtimeChannel | null>(null)
   const presenceChannelRef = useRef<RealtimeChannel | null>(null)
+  const selectedFriendIdRef = useRef<string | null>(null)
 
-  // Fetch friends list
+  // Keep ref in sync with state
+  useEffect(() => {
+    selectedFriendIdRef.current = selectedFriend?.id ?? null
+  }, [selectedFriend?.id])
+
+  // Fetch friends list - no onlineUsers dependency to prevent loop
   const fetchFriends = useCallback(async () => {
     if (!currentUserId) return
 
@@ -41,13 +48,11 @@ export function useChat(currentUserId: string | null) {
       return
     }
 
-    const friendsList: ChatUser[] = (data || []).map((f) => ({
+    setFriends((data || []).map((f) => ({
       ...((f.friend as unknown as Profile) || {}),
-      isOnline: onlineUsers.has(f.friend_id),
-    })) as ChatUser[]
-
-    setFriends(friendsList)
-  }, [currentUserId, supabase, onlineUsers])
+      isOnline: false, // Will be updated by presence
+    })) as ChatUser[])
+  }, [currentUserId, supabase])
 
   // Fetch friend requests
   const fetchRequests = useCallback(async () => {
@@ -105,18 +110,18 @@ export function useChat(currentUserId: string | null) {
 
   // Send message
   const sendMessage = useCallback(async (content: string) => {
-    if (!currentUserId || !selectedFriend || !content.trim()) return
+    if (!currentUserId || !selectedFriendIdRef.current || !content.trim()) return
 
     const { error } = await supabase.from('messages').insert({
       sender_id: currentUserId,
-      receiver_id: selectedFriend.id,
+      receiver_id: selectedFriendIdRef.current,
       content: content.trim(),
     })
 
     if (error) {
       console.error('Error sending message:', error)
     }
-  }, [currentUserId, selectedFriend, supabase])
+  }, [currentUserId, supabase])
 
   // Send friend request
   const sendFriendRequest = useCallback(async (username: string) => {
@@ -224,20 +229,80 @@ export function useChat(currentUserId: string | null) {
       .delete()
       .or(`and(user_id.eq.${currentUserId},friend_id.eq.${friendId}),and(user_id.eq.${friendId},friend_id.eq.${currentUserId})`)
 
-    if (selectedFriend?.id === friendId) {
+    if (selectedFriendIdRef.current === friendId) {
       setSelectedFriend(null)
     }
 
     await fetchFriends()
-  }, [currentUserId, supabase, selectedFriend, fetchFriends])
+  }, [currentUserId, supabase, fetchFriends])
 
-  // Set up realtime subscriptions
+  // Initial data fetch - only run once
+  useEffect(() => {
+    if (!currentUserId) return
+
+    let mounted = true
+
+    const loadData = async () => {
+      setIsLoading(true)
+      
+      // Fetch friends
+      const { data: friendsData } = await supabase
+        .from('friendships')
+        .select(`
+          id,
+          friend_id,
+          friend:profiles!friendships_friend_id_fkey(*)
+        `)
+        .eq('user_id', currentUserId)
+
+      if (mounted) {
+        setFriends((friendsData || []).map((f) => ({
+          ...((f.friend as unknown as Profile) || {}),
+          isOnline: false,
+        })) as ChatUser[])
+      }
+
+      // Fetch pending requests
+      const { data: pending } = await supabase
+        .from('friend_requests')
+        .select(`
+          *,
+          from_profile:profiles!friend_requests_from_user_id_fkey(*)
+        `)
+        .eq('to_user_id', currentUserId)
+        .eq('status', 'pending')
+
+      // Fetch sent requests
+      const { data: sent } = await supabase
+        .from('friend_requests')
+        .select(`
+          *,
+          to_profile:profiles!friend_requests_to_user_id_fkey(*)
+        `)
+        .eq('from_user_id', currentUserId)
+        .eq('status', 'pending')
+
+      if (mounted) {
+        setPendingRequests((pending || []) as FriendRequest[])
+        setSentRequests((sent || []) as FriendRequest[])
+        setIsLoading(false)
+      }
+    }
+
+    loadData()
+
+    return () => {
+      mounted = false
+    }
+  }, [currentUserId, supabase])
+
+  // Set up realtime subscriptions - separate from data fetching
   useEffect(() => {
     if (!currentUserId) return
 
     // Messages subscription
     channelRef.current = supabase
-      .channel('chat-messages')
+      .channel(`chat-messages-${currentUserId}`)
       .on(
         'postgres_changes',
         {
@@ -248,7 +313,7 @@ export function useChat(currentUserId: string | null) {
         },
         (payload) => {
           const newMessage = payload.new as Message
-          if (selectedFriend?.id === newMessage.sender_id) {
+          if (selectedFriendIdRef.current === newMessage.sender_id) {
             setMessages((prev) => [...prev, newMessage])
             // Mark as read immediately
             supabase
@@ -268,7 +333,7 @@ export function useChat(currentUserId: string | null) {
         },
         (payload) => {
           const newMessage = payload.new as Message
-          if (selectedFriend?.id === newMessage.receiver_id) {
+          if (selectedFriendIdRef.current === newMessage.receiver_id) {
             setMessages((prev) => [...prev, newMessage])
           }
         }
@@ -280,8 +345,22 @@ export function useChat(currentUserId: string | null) {
           schema: 'public',
           table: 'friend_requests',
         },
-        () => {
-          fetchRequests()
+        async () => {
+          // Inline fetch to avoid dependency
+          const { data: pending } = await supabase
+            .from('friend_requests')
+            .select(`*, from_profile:profiles!friend_requests_from_user_id_fkey(*)`)
+            .eq('to_user_id', currentUserId)
+            .eq('status', 'pending')
+
+          const { data: sent } = await supabase
+            .from('friend_requests')
+            .select(`*, to_profile:profiles!friend_requests_to_user_id_fkey(*)`)
+            .eq('from_user_id', currentUserId)
+            .eq('status', 'pending')
+
+          setPendingRequests((pending || []) as FriendRequest[])
+          setSentRequests((sent || []) as FriendRequest[])
         }
       )
       .on(
@@ -291,8 +370,17 @@ export function useChat(currentUserId: string | null) {
           schema: 'public',
           table: 'friendships',
         },
-        () => {
-          fetchFriends()
+        async () => {
+          // Inline fetch to avoid dependency
+          const { data } = await supabase
+            .from('friendships')
+            .select(`id, friend_id, friend:profiles!friendships_friend_id_fkey(*)`)
+            .eq('user_id', currentUserId)
+
+          setFriends((data || []).map((f) => ({
+            ...((f.friend as unknown as Profile) || {}),
+            isOnline: false,
+          })) as ChatUser[])
         }
       )
       .subscribe()
@@ -324,7 +412,7 @@ export function useChat(currentUserId: string | null) {
         supabase.removeChannel(presenceChannelRef.current)
       }
     }
-  }, [currentUserId, selectedFriend?.id, supabase, fetchRequests, fetchFriends])
+  }, [currentUserId, supabase])
 
   // Update friends online status when onlineUsers changes
   useEffect(() => {
@@ -333,19 +421,6 @@ export function useChat(currentUserId: string | null) {
     )
   }, [onlineUsers])
 
-  // Initial data fetch
-  useEffect(() => {
-    if (!currentUserId) return
-
-    const loadData = async () => {
-      setIsLoading(true)
-      await Promise.all([fetchFriends(), fetchRequests()])
-      setIsLoading(false)
-    }
-
-    loadData()
-  }, [currentUserId, fetchFriends, fetchRequests])
-
   // Fetch messages when friend is selected
   useEffect(() => {
     if (selectedFriend) {
@@ -353,7 +428,7 @@ export function useChat(currentUserId: string | null) {
     } else {
       setMessages([])
     }
-  }, [selectedFriend, fetchMessages])
+  }, [selectedFriend?.id, fetchMessages])
 
   return {
     friends,
