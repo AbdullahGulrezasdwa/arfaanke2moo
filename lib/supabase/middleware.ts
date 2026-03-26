@@ -2,12 +2,10 @@ import { createServerClient } from '@supabase/ssr'
 import { NextResponse, type NextRequest } from 'next/server'
 
 export async function updateSession(request: NextRequest) {
-  // 1. Create an initial response
   let supabaseResponse = NextResponse.next({
     request,
   })
 
-  // 2. Initialize Supabase client
   const supabase = createServerClient(
     process.env.NEXT_PUBLIC_SUPABASE_URL!,
     process.env.NEXT_PUBLIC_SUPABASE_ANON_KEY!,
@@ -17,10 +15,7 @@ export async function updateSession(request: NextRequest) {
           return request.cookies.getAll()
         },
         setAll(cookiesToSet) {
-          cookiesToSet.forEach(({ name, value }) =>
-            request.cookies.set(name, value)
-          )
-          // Create a new response to ensure cookies are captured
+          cookiesToSet.forEach(({ name, value }) => request.cookies.set(name, value))
           supabaseResponse = NextResponse.next({
             request,
           })
@@ -32,45 +27,28 @@ export async function updateSession(request: NextRequest) {
     }
   )
 
-  // 3. Get the current user
-  const {
-    data: { user },
-  } = await supabase.auth.getUser()
+  // IMPORTANT: Use getUser() not getSession() - it's more secure and prevents spoofing
+  const { data: { user } } = await supabase.auth.getUser()
 
-  // 4. Handle Protected Routes (e.g., /chat)
-  const protectedRoutes = ['/chat', '/protected']
-  const isProtectedRoute = protectedRoutes.some((route) =>
-    request.nextUrl.pathname.startsWith(route)
-  )
+  const url = request.nextUrl.clone()
 
-  if (isProtectedRoute && !user) {
-    const url = request.nextUrl.clone()
+  // 1. If on /chat and NOT logged in -> Go to Login
+  if (url.pathname.startsWith('/chat') && !user) {
     url.pathname = '/auth/login'
     return NextResponse.redirect(url)
   }
 
-  // 5. Handle Auth Routes (Redirect logged-in users AWAY from login/signup)
-  const authRoutes = ['/auth/login', '/auth/sign-up']
-  const isAuthRoute = authRoutes.some((route) =>
-    request.nextUrl.pathname.startsWith(route)
-  )
-
-  if (isAuthRoute && user) {
-    const url = request.nextUrl.clone()
+  // 2. If on /auth and IS logged in -> Go to Chat
+  if (url.pathname.startsWith('/auth') && user) {
     url.pathname = '/chat'
-    
-    // Create the redirect response
-    const redirectResponse = NextResponse.redirect(url)
-    
-    // IMPORTANT: Copy the session cookies to the redirect response
-    // so the browser knows we are logged in when we hit /chat
+    // This is the most important part: we MUST pass the supabaseResponse cookies
+    // to the redirect, otherwise the browser "forgets" we just logged in.
+    const response = NextResponse.redirect(url)
     supabaseResponse.cookies.getAll().forEach((cookie) => {
-        redirectResponse.cookies.set(cookie.name, cookie.value, cookie)
+      response.cookies.set(cookie.name, cookie.value, cookie)
     })
-    
-    return redirectResponse
+    return response
   }
 
-  // 6. Return the response with the session cookies attached
   return supabaseResponse
 }
